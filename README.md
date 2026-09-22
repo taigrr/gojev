@@ -1,5 +1,10 @@
 # gojev
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/taigrr/gojev.svg)](https://pkg.go.dev/github.com/taigrr/gojev)
+[![Test](https://github.com/taigrr/gojev/actions/workflows/test.yml/badge.svg)](https://github.com/taigrr/gojev/actions/workflows/test.yml)
+[![Lint](https://github.com/taigrr/gojev/actions/workflows/lint.yml/badge.svg)](https://github.com/taigrr/gojev/actions/workflows/lint.yml)
+[![License: 0BSD](https://img.shields.io/badge/license-0BSD-blue.svg)](LICENSE)
+
 Go harness for [System One](https://docs.typesafe.ai/concepts/system-one) decision models: TypeSafe's hosted **Jev** and the open-weight, self-hostable **Kev**.
 
 Decision models do not generate text.
@@ -67,7 +72,7 @@ d, err := gojev.Classify(ctx, model, toolCall, "Should this run without asking?"
 if v, ok := d.Above(0.8, 0.3); ok && v == Allow { ... } // confident AND unambiguous
 ```
 
-Also: `gojev.Yes(ctx, model, state, q, threshold)`, `gojev.Ask(...)`, `gojev.Fallback(cloud, localKev)`.
+Also: `gojev.AskBool(ctx, model, state, q).Above(threshold)`, `gojev.Rate(...)`, `gojev.Ask(...)`, `gojev.Fallback(cloud, localKev)`.
 
 ### From catwalk
 
@@ -136,3 +141,7 @@ go run ./cmd/gojev -provider vercel \
 go test ./...
 staticcheck ./...
 ```
+
+## License
+
+[0BSD](LICENSE)

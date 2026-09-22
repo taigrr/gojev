@@ -15,6 +15,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"strings"
 
@@ -52,12 +54,40 @@ var ErrNoEvaluators = errors.New("gojev: no evaluation models available")
 // evaluation-capable fantasy implementation.
 var ErrUnsupportedProvider = errors.New("gojev: provider does not support evaluation models")
 
-// Evaluate is a convenience wrapper around model.Evaluate.
+// ErrNilResponse is returned when a model yields neither a response nor an
+// error.
+var ErrNilResponse = errors.New("gojev: model returned nil response")
+
+// ErrMissingAnswer is returned when the response lacks the requested answer.
+var ErrMissingAnswer = errors.New("gojev: response missing answer")
+
+// ErrAnswerTypeMismatch is returned when the answer's type differs from the
+// question that was asked.
+var ErrAnswerTypeMismatch = errors.New("gojev: answer type does not match question")
+
+// ErrUnknownChoice is returned by Classify when the model selects, or
+// assigns probability to, an option the caller did not offer.
+var ErrUnknownChoice = errors.New("gojev: model returned an option that was not offered")
+
+// ErrMissingAPIKey is returned by FromCatwalk when a hosted provider's API
+// key resolves to the empty string.
+var ErrMissingAPIKey = errors.New("gojev: provider API key is empty")
+
+// Evaluate is a convenience wrapper around model.Evaluate. A model that
+// returns neither a response nor an error yields ErrNilResponse.
 func Evaluate(ctx context.Context, model fantasy.EvaluationModel, state any, questions Questions) (*fantasy.EvaluationResponse, error) {
-	return model.Evaluate(ctx, fantasy.EvaluationCall{State: state, Questions: questions})
+	resp, err := model.Evaluate(ctx, fantasy.EvaluationCall{State: state, Questions: questions})
+	if err != nil {
+		return nil, err
+	}
+	if resp == nil {
+		return nil, ErrNilResponse
+	}
+	return resp, nil
 }
 
-// Ask evaluates a single question and returns its answer.
+// Ask evaluates a single question and returns its answer. The answer's type
+// is checked against the question; a mismatch is ErrAnswerTypeMismatch.
 func Ask(ctx context.Context, model fantasy.EvaluationModel, state any, question fantasy.EvaluationQuestion) (fantasy.EvaluationAnswer, error) {
 	const key = "q"
 	resp, err := Evaluate(ctx, model, state, Questions{key: question})
@@ -66,7 +96,10 @@ func Ask(ctx context.Context, model fantasy.EvaluationModel, state any, question
 	}
 	answer, ok := resp.Answers[key]
 	if !ok {
-		return fantasy.EvaluationAnswer{}, errors.New("gojev: response missing answer")
+		return fantasy.EvaluationAnswer{}, ErrMissingAnswer
+	}
+	if answer.Type != question.Type {
+		return fantasy.EvaluationAnswer{}, fmt.Errorf("%w: asked %q, got %q", ErrAnswerTypeMismatch, question.Type, answer.Type)
 	}
 	return answer, nil
 }
@@ -78,50 +111,74 @@ type Decision[T ~string] struct {
 	Confidence    *float64
 }
 
-// Margin is the gap between the top two option probabilities.
+// Margin is the gap between the selected option's probability and the
+// highest probability among the other options. It is 0 when Selected is
+// absent from Probabilities, and equals P(Selected) when it is the only
+// option.
 func (d Decision[T]) Margin() float64 {
-	first, second := 0.0, 0.0
-	for _, p := range d.Probabilities {
-		if p > first {
-			first, second = p, first
-		} else if p > second {
-			second = p
+	selected, ok := d.Probabilities[d.Selected]
+	if !ok {
+		return 0
+	}
+	best := 0.0
+	for option, p := range d.Probabilities {
+		if option != d.Selected && p > best {
+			best = p
 		}
 	}
-	if len(d.Probabilities) == 1 {
-		return first
-	}
-	return first - second
+	return selected - best
 }
 
 // Above returns the selected option only if its probability is at least
-// threshold and the margin over the runner-up is at least minMargin.
+// threshold and the margin over the runner-up is at least minMargin. A
+// selection with no recorded probability (or a NaN probability) never
+// passes, regardless of thresholds.
 func (d Decision[T]) Above(threshold, minMargin float64) (T, bool) {
 	var zero T
-	if d.Probabilities[d.Selected] < threshold || d.Margin() < minMargin {
+	p, ok := d.Probabilities[d.Selected]
+	if !ok || !(p >= threshold) || !(d.Margin() >= minMargin) {
 		return zero, false
 	}
 	return d.Selected, true
 }
 
 // Classify asks a Choice question over the given typed options and returns a
-// typed Decision. Descriptions may be nil or omit options.
+// typed Decision. Descriptions may be nil or omit options. The model's
+// selection and every option it assigns probability to must be one of the
+// offered options; otherwise ErrUnknownChoice is returned. Offered options
+// missing from the response are recorded with probability 0.
 func Classify[T ~string](ctx context.Context, model fantasy.EvaluationModel, state any, instructions string, options []T, descriptions map[T]string) (Decision[T], error) {
 	wire := make(map[string]string, len(options))
+	offered := make(map[T]struct{}, len(options))
 	for _, option := range options {
 		wire[string(option)] = descriptions[option]
+		offered[option] = struct{}{}
 	}
 	answer, err := Ask(ctx, model, state, Choice(instructions, wire))
 	if err != nil {
 		return Decision[T]{}, err
 	}
+	selected := T(answer.Choice)
+	if _, ok := offered[selected]; !ok {
+		return Decision[T]{}, fmt.Errorf("%w: %q", ErrUnknownChoice, answer.Choice)
+	}
+	if len(answer.Probabilities) == 0 {
+		return Decision[T]{}, fmt.Errorf("%w: no option probabilities", ErrAnswerTypeMismatch)
+	}
 	decision := Decision[T]{
-		Selected:      T(answer.Choice),
-		Probabilities: make(map[T]float64, len(answer.Probabilities)),
+		Selected:      selected,
+		Probabilities: make(map[T]float64, len(options)),
 		Confidence:    answer.Confidence,
 	}
+	for _, option := range options {
+		decision.Probabilities[option] = 0
+	}
 	for option, p := range answer.Probabilities {
-		decision.Probabilities[T(option)] = p
+		key := T(option)
+		if _, ok := offered[key]; !ok {
+			return Decision[T]{}, fmt.Errorf("%w: probability for %q", ErrUnknownChoice, option)
+		}
+		decision.Probabilities[key] = p
 	}
 	return decision, nil
 }
@@ -155,16 +212,36 @@ type Rating struct {
 	Confidence    *float64
 }
 
+// LevelIndex returns the index of the label nearest the expected score
+// (rounding half up), clamped to the rubric. It is -1 for an empty rubric
+// or a NaN score.
+func (r Rating) LevelIndex() int {
+	if len(r.Levels) == 0 || math.IsNaN(r.Score) {
+		return -1
+	}
+	last := len(r.Levels) - 1
+	switch {
+	case r.Score <= 0:
+		return 0
+	case r.Score >= float64(last):
+		return last
+	}
+	return int(math.Floor(r.Score + 0.5))
+}
+
 // Level returns the label nearest the expected score.
 func (r Rating) Level() string {
-	if len(r.Levels) == 0 {
+	idx := r.LevelIndex()
+	if idx < 0 {
 		return ""
 	}
-	idx := min(max(int(r.Score+0.5), 0), len(r.Levels)-1)
 	return r.Levels[idx]
 }
 
-// AtLeast reports whether the expected score reaches the named level.
+// AtLeast reports whether the expected score reaches the named level. It is
+// a threshold on the raw expected score, so it is stricter than Level():
+// a score of 1.6 over three levels has Level() == Levels[2] but is not
+// AtLeast(Levels[2]). Unknown labels are never reached.
 func (r Rating) AtLeast(level string) bool {
 	for i, name := range r.Levels {
 		if name == level {
@@ -174,23 +251,38 @@ func (r Rating) AtLeast(level string) bool {
 	return false
 }
 
-// Rate asks a Score question and returns a typed Rating.
+// Rate asks a Score question and returns a typed Rating. The caller's
+// levels are used as the rubric labels so lookups by name always match
+// what was asked, regardless of any normalisation the model applies.
 func Rate(ctx context.Context, model fantasy.EvaluationModel, state any, instructions string, levels ...string) (Rating, error) {
 	answer, err := Ask(ctx, model, state, Score(instructions, levels...))
 	if err != nil {
 		return Rating{}, err
 	}
-	rating := Rating{Score: answer.Score, Levels: answer.Levels, Probabilities: answer.LevelProbabilities, Confidence: answer.Confidence}
-	if len(rating.Levels) == 0 {
-		rating.Levels = levels
+	if len(answer.LevelProbabilities) != 0 && len(answer.LevelProbabilities) != len(levels) {
+		return Rating{}, fmt.Errorf("%w: %d level probabilities for %d levels", ErrAnswerTypeMismatch, len(answer.LevelProbabilities), len(levels))
 	}
-	return rating, nil
+	if len(answer.Levels) != 0 && len(answer.Levels) != len(levels) {
+		return Rating{}, fmt.Errorf("%w: model echoed %d levels for %d asked", ErrAnswerTypeMismatch, len(answer.Levels), len(levels))
+	}
+	return Rating{Score: answer.Score, Levels: levels, Probabilities: answer.LevelProbabilities, Confidence: answer.Confidence}, nil
 }
 
 // Fallback chains models: each call tries them in order and returns the first
 // success. Errors from all members are joined when every member fails.
+// Untyped nil members are ignored. All members share the caller's context,
+// so a slow first member can exhaust the deadline before later members are
+// tried; give the context enough budget for the whole chain. Load and Close
+// are forwarded to members that implement them; note that fantasy's
+// in-process Kev exposes Close on its provider, not its model.
 func Fallback(models ...fantasy.EvaluationModel) fantasy.EvaluationModel {
-	return &fallback{models: models}
+	kept := make([]fantasy.EvaluationModel, 0, len(models))
+	for _, model := range models {
+		if model != nil {
+			kept = append(kept, model)
+		}
+	}
+	return &fallback{models: kept}
 }
 
 type fallback struct {
@@ -201,18 +293,64 @@ func (f *fallback) Evaluate(ctx context.Context, call fantasy.EvaluationCall) (*
 	if len(f.models) == 0 {
 		return nil, ErrNoEvaluators
 	}
+	if err := call.Validate(); err != nil {
+		return nil, err
+	}
 	var errs []error
 	for _, model := range f.models {
 		resp, err := model.Evaluate(ctx, call)
+		if err == nil && resp == nil {
+			err = ErrNilResponse
+		}
 		if err == nil {
 			return resp, nil
 		}
-		if ctx.Err() != nil {
-			return nil, err
-		}
 		errs = append(errs, fmt.Errorf("%s/%s: %w", model.Provider(), model.Model(), err))
+		if ctx.Err() != nil {
+			break
+		}
 	}
 	return nil, errors.Join(errs...)
+}
+
+// Load warms every member that supports loading. Mirroring Evaluate, it
+// only fails when every loadable member failed, so an unavailable local
+// model does not prevent the chain from serving via another member.
+func (f *fallback) Load(ctx context.Context) error {
+	var errs []error
+	loadable, loaded := 0, 0
+	for _, model := range f.models {
+		loader, ok := model.(interface{ Load(context.Context) error })
+		if !ok {
+			continue
+		}
+		loadable++
+		if err := loader.Load(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("%s/%s: %w", model.Provider(), model.Model(), err))
+			if ctx.Err() != nil {
+				break
+			}
+			continue
+		}
+		loaded++
+	}
+	if loadable > 0 && loaded == 0 {
+		return errors.Join(errs...)
+	}
+	return nil
+}
+
+// Close releases every member that implements io.Closer, joining errors.
+func (f *fallback) Close() error {
+	var errs []error
+	for _, model := range f.models {
+		if closer, ok := model.(io.Closer); ok {
+			if err := closer.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("%s/%s: %w", model.Provider(), model.Model(), err))
+			}
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func (f *fallback) Provider() string {
@@ -234,12 +372,21 @@ func (f *fallback) Model() string {
 
 // FromCatwalk builds an evaluation model from a catwalk provider entry using
 // its default evaluation model (or modelID when non-empty). API keys of the
-// form $ENV are resolved from the environment.
+// form $ENV are resolved from the environment; callers whose configuration
+// layer supports richer expansion should resolve provider.APIKey before
+// calling. Hosted endpoints (vercel, and typesafe without a custom
+// APIEndpoint) require a non-empty key and return ErrMissingAPIKey
+// otherwise; a typesafe-type entry with its own APIEndpoint, such as a
+// local Kev server, may omit the key.
 func FromCatwalk(ctx context.Context, provider catwalk.Provider, modelID string) (fantasy.EvaluationModel, error) {
 	if modelID == "" {
 		modelID = provider.DefaultEvaluationModelID
 	}
 	apiKey := resolveEnv(provider.APIKey)
+	hosted := provider.Type == catwalk.TypeVercel || (provider.Type == catwalk.TypeTypeSafe && provider.APIEndpoint == "")
+	if apiKey == "" && hosted {
+		return nil, fmt.Errorf("%w: %q", ErrMissingAPIKey, provider.ID)
+	}
 	var p fantasy.Provider
 	var err error
 	switch provider.Type {
@@ -263,7 +410,7 @@ func FromCatwalk(ctx context.Context, provider catwalk.Provider, modelID string)
 		p, err = typesafe.New(opts...)
 	case catwalk.TypeKev:
 		opts := []kev.Option{kev.WithAutoLibraries()}
-		if modelID != "" {
+		if modelID != "" && modelID != kev.ModelLatest {
 			opts = append(opts, kev.WithCheckpoint(kev.Checkpoint(modelID)))
 		}
 		p, err = kev.New(opts...)

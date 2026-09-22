@@ -118,6 +118,9 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 
 func buildState(state string, parseJSON bool, stdin io.Reader) (any, error) {
 	if state == stateStdin {
+		if stdin == nil {
+			return nil, errors.New("no stdin available for -state -")
+		}
 		data, err := io.ReadAll(stdin)
 		if err != nil {
 			return nil, fmt.Errorf("read stdin: %w", err)
@@ -150,12 +153,12 @@ func firstEnv(names ...string) string {
 	return ""
 }
 
-func evaluationModel(p fantasy.Provider, modelID string) (fantasy.EvaluationModel, error) {
+func evaluationModel(ctx context.Context, p fantasy.Provider, modelID string) (fantasy.EvaluationModel, error) {
 	ep, ok := p.(fantasy.EvaluationProvider)
 	if !ok {
 		return nil, fmt.Errorf("provider %q does not support evaluation", p.Name())
 	}
-	return ep.EvaluationModel(context.Background(), modelID)
+	return ep.EvaluationModel(ctx, modelID)
 }
 
 func buildModel(ctx context.Context, provider, baseURL, model string, zdr bool) (fantasy.EvaluationModel, error) {
@@ -169,7 +172,7 @@ func buildModel(ctx context.Context, provider, baseURL, model string, zdr bool) 
 		if err != nil {
 			return nil, err
 		}
-		return evaluationModel(p, model)
+		return evaluationModel(ctx, p, model)
 	case providerVercel:
 		opts := []vercel.Option{vercel.WithAPIKey(firstEnv(envGatewayAPIKey, envOIDCToken, envVercelAPIKey))}
 		if baseURL != "" {
@@ -182,13 +185,13 @@ func buildModel(ctx context.Context, provider, baseURL, model string, zdr bool) 
 		if err != nil {
 			return nil, err
 		}
-		return evaluationModel(p, model)
+		return evaluationModel(ctx, p, model)
 	case providerKev:
 		// In-process Kev via llama.cpp. -model selects the checkpoint
 		// (kev-0.8b, kev-4b, kev-9b, or a local bundle dir); weights and the
 		// llama.cpp libraries are downloaded on first use.
 		opts := []kev.Option{kev.WithAutoLibraries()}
-		if model != "" {
+		if model != "" && model != kev.ModelLatest {
 			opts = append(opts, kev.WithCheckpoint(kev.Checkpoint(model)))
 		}
 		opts = append(opts, kev.WithDownloader(kev.Downloader{Progress: func(file string, done, total int64) {
@@ -203,7 +206,7 @@ func buildModel(ctx context.Context, provider, baseURL, model string, zdr bool) 
 		if err != nil {
 			return nil, err
 		}
-		return evaluationModel(p, "")
+		return evaluationModel(ctx, p, "")
 	case providerKevServer:
 		// A running kev.serve (Python) or any TypeSafe-compatible server.
 		opts := []typesafe.Option{typesafe.WithName("kev"), typesafe.WithAPIKey("local")}
@@ -218,7 +221,7 @@ func buildModel(ctx context.Context, provider, baseURL, model string, zdr bool) 
 		if model == "" {
 			model = typesafe.ModelKevLatest
 		}
-		return evaluationModel(p, model)
+		return evaluationModel(ctx, p, model)
 	default:
 		return nil, fmt.Errorf("unknown provider %q", provider)
 	}
@@ -231,13 +234,30 @@ func parseQuestions(specs []string) (gojev.Questions, error) {
 		if err != nil {
 			return nil, fmt.Errorf("-q %q: %w", spec, err)
 		}
+		if _, dup := out[name]; dup {
+			return nil, fmt.Errorf("-q %q: duplicate question name %q", spec, name)
+		}
 		out[name] = question
 	}
 	return out, nil
 }
 
+// splitList splits a comma-separated list, trimming whitespace and dropping
+// empty entries. Commas cannot be escaped; descriptions and level names
+// containing commas are not expressible on the command line.
+func splitList(list string) []string {
+	var parts []string
+	for part := range strings.SplitSeq(list, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			parts = append(parts, part)
+		}
+	}
+	return parts
+}
+
 func parseQuestion(spec string) (string, fantasy.EvaluationQuestion, error) {
 	name, rest, ok := strings.Cut(spec, "=")
+	name = strings.TrimSpace(name)
 	if !ok || name == "" {
 		return "", fantasy.EvaluationQuestion{}, errors.New("expected name=type:instructions")
 	}
@@ -246,29 +266,46 @@ func parseQuestion(spec string) (string, fantasy.EvaluationQuestion, error) {
 		return "", fantasy.EvaluationQuestion{}, errors.New("expected type:instructions")
 	}
 	instructions, criteria, _ := strings.Cut(rest, ";")
-	switch kind {
+	instructions = strings.TrimSpace(instructions)
+	if instructions == "" {
+		return "", fantasy.EvaluationQuestion{}, errors.New("instructions are empty")
+	}
+	switch strings.TrimSpace(kind) {
 	case "bool", "boolean", "noul":
 		trueCriteria, falseCriteria := "", ""
 		if criteria != "" {
 			trueCriteria, falseCriteria, _ = strings.Cut(criteria, ",")
+			trueCriteria, falseCriteria = strings.TrimSpace(trueCriteria), strings.TrimSpace(falseCriteria)
 		}
 		return name, fantasy.BoolQuestionWithCriteria(instructions, trueCriteria, falseCriteria), nil
 	case "choice":
 		options := map[string]string{}
-		for part := range strings.SplitSeq(criteria, ",") {
-			if part == "" {
-				continue
-			}
+		for _, part := range splitList(criteria) {
 			option, description, _ := strings.Cut(part, "=")
-			options[option] = description
+			option = strings.TrimSpace(option)
+			if option == "" {
+				return "", fantasy.EvaluationQuestion{}, fmt.Errorf("choice option %q has an empty name", part)
+			}
+			if _, dup := options[option]; dup {
+				return "", fantasy.EvaluationQuestion{}, fmt.Errorf("duplicate choice option %q", option)
+			}
+			options[option] = strings.TrimSpace(description)
+		}
+		if len(options) == 0 {
+			return "", fantasy.EvaluationQuestion{}, errors.New("choice needs at least one option after ';'")
 		}
 		return name, gojev.Choice(instructions, options), nil
 	case "score":
-		var levels []string
-		for part := range strings.SplitSeq(criteria, ",") {
-			if part != "" {
-				levels = append(levels, part)
+		levels := splitList(criteria)
+		if len(levels) < 2 {
+			return "", fantasy.EvaluationQuestion{}, errors.New("score needs at least two levels after ';'")
+		}
+		seen := make(map[string]struct{}, len(levels))
+		for _, level := range levels {
+			if _, dup := seen[level]; dup {
+				return "", fantasy.EvaluationQuestion{}, fmt.Errorf("duplicate score level %q", level)
 			}
+			seen[level] = struct{}{}
 		}
 		return name, gojev.Score(instructions, levels...), nil
 	default:
@@ -308,6 +345,8 @@ func printResponse(w io.Writer, resp *fantasy.EvaluationResponse) {
 				}
 				fmt.Fprintf(w, "  %d %s: %.3f\n", i, label, prob)
 			}
+		default:
+			fmt.Fprintf(w, "%s: (unrecognised answer type %q)\n", name, answer.Type)
 		}
 	}
 	fmt.Fprintf(w, "usage: in=%d out=%d\n", resp.Usage.InputTokens, resp.Usage.OutputTokens)
@@ -318,7 +357,12 @@ func printProbabilities(w io.Writer, probs map[string]float64) {
 	for key := range probs {
 		keys = append(keys, key)
 	}
-	sort.Slice(keys, func(i, j int) bool { return probs[keys[i]] > probs[keys[j]] })
+	sort.Slice(keys, func(i, j int) bool {
+		if probs[keys[i]] != probs[keys[j]] {
+			return probs[keys[i]] > probs[keys[j]]
+		}
+		return keys[i] < keys[j]
+	})
 	for _, key := range keys {
 		fmt.Fprintf(w, "  %s: %.3f\n", key, probs[key])
 	}

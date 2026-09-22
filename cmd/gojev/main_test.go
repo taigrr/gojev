@@ -32,10 +32,34 @@ func TestParseQuestion(t *testing.T) {
 		t.Fatalf("bool parse: %+v %v", q, err)
 	}
 
-	for _, bad := range []string{"noname", "x=nope:hi", "x=bool"} {
+	// Whitespace around list items is trimmed.
+	_, q, err = parseQuestion("u=score: How urgent? ; low, medium , high")
+	if err != nil || len(q.Levels) != 3 || q.Levels[1] != "medium" || q.Instructions != "How urgent?" {
+		t.Fatalf("trimmed score parse: %+v %v", q, err)
+	}
+	_, q, err = parseQuestion("r=choice:Route; billing = payments , shipping")
+	if err != nil || q.Options["billing"] != "payments" {
+		t.Fatalf("trimmed choice parse: %+v %v", q, err)
+	}
+	if _, has := q.Options["shipping"]; !has {
+		t.Fatal("expected shipping option")
+	}
+
+	for _, bad := range []string{
+		"noname", "x=nope:hi", "x=bool", "x=bool:", "=bool:hi",
+		"c=choice:pick", "c=choice:pick;=desc", "c=choice:pick;a,a",
+		"s=score:rate;only", "s=score:rate;low,low",
+	} {
 		if _, _, err := parseQuestion(bad); err == nil {
 			t.Errorf("expected error for %q", bad)
 		}
+	}
+
+	if _, err := parseQuestions([]string{"a=bool:x", "a=bool:y"}); err == nil {
+		t.Error("expected duplicate name error")
+	}
+	if _, err := buildState(stateStdin, false, nil); err == nil {
+		t.Error("expected nil stdin error")
 	}
 }
 
