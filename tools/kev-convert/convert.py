@@ -34,12 +34,24 @@ import torch
 from huggingface_hub import snapshot_download
 
 
+DEFAULT_REVISION = "main"
+
+
 def sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def split_hub_run(run_arg: str) -> tuple[str, str]:
+    repo, _, revision = run_arg.partition("@")
+    return repo, revision or DEFAULT_REVISION
+
+
+def resolved_snapshot_commit(path: Path) -> str | None:
+    return path.name if path.parent.name == "snapshots" else None
 
 
 def main() -> None:
@@ -50,11 +62,18 @@ def main() -> None:
     ap.add_argument("--outtype", default="f16", choices=["f16", "bf16", "f32", "q8_0"])
     args = ap.parse_args()
 
-    repo, _, revision = args.run.partition("@")
-    run = args.run if os.path.isdir(args.run) else snapshot_download(
-        repo, revision=revision or None, allow_patterns=["*.json", "*.safetensors", "*.pt", "*.txt", "*.jinja"]
-    )
+    if os.path.isdir(args.run):
+        run = args.run
+        source_revision = None
+        source_commit = None
+    else:
+        repo, source_revision = split_hub_run(args.run)
+        run = snapshot_download(
+            repo, revision=source_revision, allow_patterns=["*.json", "*.safetensors", "*.pt", "*.txt", "*.jinja"]
+        )
     run = Path(run)
+    if source_revision is not None:
+        source_commit = resolved_snapshot_commit(run)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -97,6 +116,8 @@ def main() -> None:
         "base": base,
         "base_revision": base_revision,
         "run": args.run,
+        "source_revision": source_revision,
+        "source_commit": source_commit,
         "hidden_size": int(head["q.weight"].shape[1]),
         "head_dim": int(head["q.weight"].shape[0]),
         "temperature": float(meta.get("temperature", 1.0)),
@@ -115,6 +136,8 @@ def main() -> None:
     manifest = {
         "format": 1,
         "run": args.run,
+        "source_revision": source_revision,
+        "source_commit": source_commit,
         "base": base,
         "temperature": head_json["temperature"],
         "hidden_size": head_json["hidden_size"],

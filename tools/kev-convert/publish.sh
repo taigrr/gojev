@@ -23,6 +23,7 @@ weights (fp32 merge, stored f16) plus the pointer head in \`head.json\`. Produce
 \`github.com/taigrr/fantasy/providers/kev\`.
 
 Files are checksummed in \`manifest.json\`; the Go loader verifies them on download.
+\`manifest.json\` also records \`source_revision\` and \`source_commit\` for the upstream Kev checkpoint.
 EOF
   hf upload "$repo" "$dir" . --commit-message "publish $name bundle"
 done
