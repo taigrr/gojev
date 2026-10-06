@@ -1,5 +1,6 @@
 // Command gojev evaluates a state against typed questions using Jev (via
-// TypeSafe or Vercel AI Gateway) or a local Kev server.
+// TypeSafe or Vercel AI Gateway), Clef (via Cloudflare Workers AI) or a
+// local Kev.
 //
 // Questions are given as name=type:instructions[;criteria] flags:
 //
@@ -22,21 +23,24 @@ import (
 	"time"
 
 	"github.com/taigrr/fantasy"
+	"github.com/taigrr/fantasy/providers/cloudflare"
+	"github.com/taigrr/fantasy/providers/kev"
 	"github.com/taigrr/fantasy/providers/typesafe"
 	"github.com/taigrr/fantasy/providers/vercel"
-
-	"github.com/taigrr/fantasy/providers/kev"
 	"github.com/taigrr/gojev"
 	"github.com/taigrr/gojev/internal/version"
 )
 
 const (
-	providerTypeSafe  = "typesafe"
-	providerVercel    = "vercel"
-	providerKev       = "kev"
-	providerKevServer = "kev-server"
+	providerTypeSafe   = "typesafe"
+	providerVercel     = "vercel"
+	providerCloudflare = "cloudflare"
+	providerKev        = "kev"
+	providerKevServer  = "kev-server"
 
 	stateStdin = "-"
+
+	defaultKevServerURL = "http://127.0.0.1:8008"
 )
 
 type questionFlags []string
@@ -53,9 +57,11 @@ func main() {
 
 func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	flags := flag.NewFlagSet("gojev", flag.ContinueOnError)
-	provider := flags.String("provider", providerVercel, "provider: typesafe, vercel, kev (in-process), or kev-server")
+	provider := flags.String("provider", providerVercel, "provider: typesafe, vercel, cloudflare, kev (in-process), or kev-server")
 	model := flags.String("model", "", "model override (default depends on provider)")
-	baseURL := flags.String("base-url", "", "base URL override")
+	baseURL := flags.String("base-url", "", "base URL override (cloudflare: the Workers AI run root, e.g. an AI Gateway)")
+	accountID := flags.String("account", "", "cloudflare: account id (default $"+envCloudflareAccountID+")")
+	gatewayID := flags.String("gateway", "", "cloudflare: route through the named AI Gateway")
 	state := flags.String("state", "", "state text to evaluate, or - to read stdin")
 	stateJSON := flags.Bool("json-state", false, "parse state as JSON instead of a string")
 	asJSON := flags.Bool("json", false, "print the full response as JSON")
@@ -87,7 +93,14 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	evaluator, err := buildModel(context.Background(), *provider, *baseURL, *model, *zdr)
+	evaluator, err := buildModel(context.Background(), modelConfig{
+		provider:  *provider,
+		baseURL:   *baseURL,
+		model:     *model,
+		accountID: *accountID,
+		gatewayID: *gatewayID,
+		zdr:       *zdr,
+	})
 	if err != nil {
 		return err
 	}
@@ -138,10 +151,15 @@ func buildState(state string, parseJSON bool, stdin io.Reader) (any, error) {
 }
 
 const (
-	envTypeSafeAPIKey = "TYPESAFE_API_KEY"
-	envGatewayAPIKey  = "AI_GATEWAY_API_KEY"
-	envVercelAPIKey   = "VERCEL_API_KEY"
-	envOIDCToken      = "VERCEL_OIDC_TOKEN"
+	envTypeSafeAPIKey       = "TYPESAFE_API_KEY"
+	envGatewayAPIKey        = "AI_GATEWAY_API_KEY"
+	envVercelAPIKey         = "VERCEL_API_KEY"
+	envOIDCToken            = "VERCEL_OIDC_TOKEN"
+	envCloudflareAPIToken   = "CLOUDFLARE_API_TOKEN"
+	envCloudflareAuthToken  = "CLOUDFLARE_AUTH_TOKEN"
+	envCloudflareAccountID  = gojev.EnvCloudflareAccountID
+	envCloudflareGatewayID  = "CLOUDFLARE_GATEWAY_ID"
+	envCloudflareWorkersURL = "CLOUDFLARE_WORKERS_AI_URL"
 )
 
 func firstEnv(names ...string) string {
@@ -161,8 +179,19 @@ func evaluationModel(ctx context.Context, p fantasy.Provider, modelID string) (f
 	return ep.EvaluationModel(ctx, modelID)
 }
 
-func buildModel(ctx context.Context, provider, baseURL, model string, zdr bool) (fantasy.EvaluationModel, error) {
-	switch provider {
+// modelConfig carries the CLI's provider selection.
+type modelConfig struct {
+	provider  string
+	baseURL   string
+	model     string
+	accountID string
+	gatewayID string
+	zdr       bool
+}
+
+func buildModel(ctx context.Context, cfg modelConfig) (fantasy.EvaluationModel, error) {
+	baseURL, model := cfg.baseURL, cfg.model
+	switch cfg.provider {
 	case providerTypeSafe:
 		opts := []typesafe.Option{typesafe.WithAPIKey(firstEnv(envTypeSafeAPIKey))}
 		if baseURL != "" {
@@ -178,10 +207,37 @@ func buildModel(ctx context.Context, provider, baseURL, model string, zdr bool) 
 		if baseURL != "" {
 			opts = append(opts, vercel.WithBaseURL(baseURL))
 		}
-		if zdr {
+		if cfg.zdr {
 			opts = append(opts, vercel.WithEvaluationOptions(vercel.EvaluationOptions{ZeroDataRetention: true}))
 		}
 		p, err := vercel.New(opts...)
+		if err != nil {
+			return nil, err
+		}
+		return evaluationModel(ctx, p, model)
+	case providerCloudflare:
+		// Clef on Workers AI. -base-url replaces the run root entirely (for
+		// example an AI Gateway); otherwise it is derived from the account.
+		opts := []cloudflare.Option{cloudflare.WithAPIKey(firstEnv(envCloudflareAPIToken, envCloudflareAuthToken))}
+		if baseURL == "" {
+			baseURL = firstEnv(envCloudflareWorkersURL)
+		}
+		if baseURL != "" {
+			opts = append(opts, cloudflare.WithBaseURL(baseURL))
+		} else {
+			accountID := cfg.accountID
+			if accountID == "" {
+				accountID = firstEnv(envCloudflareAccountID)
+			}
+			if accountID == "" {
+				return nil, fmt.Errorf("cloudflare: -account, $%s or -base-url is required", envCloudflareAccountID)
+			}
+			opts = append(opts, cloudflare.WithAccountID(accountID))
+		}
+		if gatewayID := firstNonEmpty(cfg.gatewayID, firstEnv(envCloudflareGatewayID)); gatewayID != "" {
+			opts = append(opts, cloudflare.WithGatewayID(gatewayID))
+		}
+		p, err := cloudflare.New(opts...)
 		if err != nil {
 			return nil, err
 		}
@@ -211,7 +267,7 @@ func buildModel(ctx context.Context, provider, baseURL, model string, zdr bool) 
 		// A running kev.serve (Python) or any TypeSafe-compatible server.
 		opts := []typesafe.Option{typesafe.WithName("kev"), typesafe.WithAPIKey("local")}
 		if baseURL == "" {
-			baseURL = "http://127.0.0.1:8008"
+			baseURL = defaultKevServerURL
 		}
 		opts = append(opts, typesafe.WithBaseURL(baseURL))
 		p, err := typesafe.New(opts...)
@@ -223,8 +279,17 @@ func buildModel(ctx context.Context, provider, baseURL, model string, zdr bool) 
 		}
 		return evaluationModel(ctx, p, model)
 	default:
-		return nil, fmt.Errorf("unknown provider %q", provider)
+		return nil, fmt.Errorf("unknown provider %q", cfg.provider)
 	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func parseQuestions(specs []string) (gojev.Questions, error) {

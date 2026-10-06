@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -102,6 +103,52 @@ func TestRunJSONState(t *testing.T) {
 	}
 	if !strings.Contains(gotState, `"state":{"a":1}`) {
 		t.Fatalf("state = %s", gotState)
+	}
+}
+
+func TestRunCloudflare(t *testing.T) {
+	var gotPath, gotAuth, gotGateway, gotModel string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotAuth, gotGateway = r.URL.Path, r.Header.Get("Authorization"), r.Header.Get("cf-aig-gateway-id")
+		var body struct {
+			Model string `json:"model"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotModel = body.Model
+		_, _ = w.Write([]byte(`{"result":{"model":"clef-flash","answers":{"urgent":{"type":"noul","noul":0.8}},"usage":{"input_tokens":5,"output_tokens":0}},"success":true,"errors":[],"messages":[]}`))
+	}))
+	defer server.Close()
+	t.Setenv(envCloudflareAPIToken, "tok")
+	t.Setenv(envCloudflareAccountID, "")
+	t.Setenv(envCloudflareWorkersURL, "")
+	t.Setenv(envCloudflareGatewayID, "")
+
+	var out bytes.Buffer
+	err := run([]string{
+		"-provider", "cloudflare", "-base-url", server.URL, "-model", "@cf/cloudflare/clef-flash", "-gateway", "gw",
+		"-state", "Checkout is down", "-q", "urgent=bool:Urgent?",
+	}, nil, &out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/@cf/cloudflare/clef-flash" || gotAuth != "Bearer tok" || gotGateway != "gw" || gotModel != "clef-flash" {
+		t.Fatalf("path=%q auth=%q gateway=%q model=%q", gotPath, gotAuth, gotGateway, gotModel)
+	}
+	if !strings.Contains(out.String(), "urgent: true (p=0.800)") {
+		t.Fatalf("output = %s", out.String())
+	}
+
+	// Without -base-url an account is required.
+	if err := run([]string{"-provider", "cloudflare", "-state", "x", "-q", "a=bool:?"}, nil, nil); err == nil || !strings.Contains(err.Error(), "-account") {
+		t.Fatalf("err = %v", err)
+	}
+	// The run root may also come from the environment.
+	t.Setenv(envCloudflareWorkersURL, server.URL)
+	if err := run([]string{"-provider", "cloudflare", "-state", "x", "-q", "a=bool:?"}, nil, &out); err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/@cf/cloudflare/clef" {
+		t.Fatalf("path = %q", gotPath)
 	}
 }
 

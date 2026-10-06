@@ -1,9 +1,11 @@
 // Package gojev is a Go harness for "System One" decision models such as
-// TypeSafe's hosted Jev and the open-weight, self-hostable Kev.
+// TypeSafe's hosted Jev, the open-weight, self-hostable Kev, and Cloudflare's
+// Clef.
 //
 // The wire protocols and the EvaluationModel abstraction live in
-// github.com/taigrr/fantasy (providers/typesafe and providers/vercel). This
-// package adds what an agent framework needs on top:
+// github.com/taigrr/fantasy (providers/typesafe, providers/vercel,
+// providers/cloudflare and providers/kev). This package adds what an agent
+// framework needs on top:
 //
 //   - construction of a fantasy.EvaluationModel from a catwalk provider entry
 //   - decision helpers: thresholds, margins, typed Classify, Fallback chains
@@ -22,6 +24,7 @@ import (
 
 	"github.com/taigrr/catwalk/pkg/catwalk"
 	"github.com/taigrr/fantasy"
+	"github.com/taigrr/fantasy/providers/cloudflare"
 	"github.com/taigrr/fantasy/providers/kev"
 	"github.com/taigrr/fantasy/providers/typesafe"
 	"github.com/taigrr/fantasy/providers/vercel"
@@ -72,6 +75,15 @@ var ErrUnknownChoice = errors.New("gojev: model returned an option that was not 
 // ErrMissingAPIKey is returned by FromCatwalk when a hosted provider's API
 // key resolves to the empty string.
 var ErrMissingAPIKey = errors.New("gojev: provider API key is empty")
+
+// ErrUnresolvedEndpoint is returned by FromCatwalk when a provider's
+// APIEndpoint references an environment variable that is not set, such as
+// $CLOUDFLARE_ACCOUNT_ID in the catwalk cloudflare entry.
+var ErrUnresolvedEndpoint = errors.New("gojev: provider endpoint references an unset environment variable")
+
+// EnvCloudflareAccountID names the Cloudflare account used when a cloudflare
+// catwalk entry has no APIEndpoint.
+const EnvCloudflareAccountID = "CLOUDFLARE_ACCOUNT_ID"
 
 // Evaluate is a convenience wrapper around model.Evaluate. A model that
 // returns neither a response nor an error yields ErrNilResponse.
@@ -372,28 +384,34 @@ func (f *fallback) Model() string {
 
 // FromCatwalk builds an evaluation model from a catwalk provider entry using
 // its default evaluation model (or modelID when non-empty). API keys of the
-// form $ENV are resolved from the environment; callers whose configuration
-// layer supports richer expansion should resolve provider.APIKey before
-// calling. Hosted endpoints (vercel, and typesafe without a custom
-// APIEndpoint) require a non-empty key and return ErrMissingAPIKey
+// form $ENV are resolved from the environment, and $ENV / ${ENV} references
+// inside APIEndpoint are expanded (an unset variable is
+// ErrUnresolvedEndpoint); callers whose configuration layer supports richer
+// expansion should resolve provider.APIKey and provider.APIEndpoint before
+// calling. Hosted endpoints (vercel, cloudflare, and typesafe without a
+// custom APIEndpoint) require a non-empty key and return ErrMissingAPIKey
 // otherwise; a typesafe-type entry with its own APIEndpoint, such as a
-// local Kev server, may omit the key.
+// local Kev server, may omit the key. A cloudflare entry without an
+// APIEndpoint uses the account named by $CLOUDFLARE_ACCOUNT_ID.
 func FromCatwalk(ctx context.Context, provider catwalk.Provider, modelID string) (fantasy.EvaluationModel, error) {
 	if modelID == "" {
 		modelID = provider.DefaultEvaluationModelID
 	}
 	apiKey := resolveEnv(provider.APIKey)
-	hosted := provider.Type == catwalk.TypeVercel || (provider.Type == catwalk.TypeTypeSafe && provider.APIEndpoint == "")
+	endpoint, err := expandEndpoint(provider.APIEndpoint)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %q", err, provider.ID)
+	}
+	hosted := provider.Type == catwalk.TypeVercel || provider.Type == catwalk.TypeCloudflare || (provider.Type == catwalk.TypeTypeSafe && endpoint == "")
 	if apiKey == "" && hosted {
 		return nil, fmt.Errorf("%w: %q", ErrMissingAPIKey, provider.ID)
 	}
 	var p fantasy.Provider
-	var err error
 	switch provider.Type {
 	case catwalk.TypeVercel:
 		opts := []vercel.Option{vercel.WithAPIKey(apiKey)}
-		if provider.APIEndpoint != "" {
-			opts = append(opts, vercel.WithBaseURL(provider.APIEndpoint))
+		if endpoint != "" {
+			opts = append(opts, vercel.WithBaseURL(endpoint))
 		}
 		if len(provider.DefaultHeaders) > 0 {
 			opts = append(opts, vercel.WithHeaders(provider.DefaultHeaders))
@@ -401,13 +419,24 @@ func FromCatwalk(ctx context.Context, provider catwalk.Provider, modelID string)
 		p, err = vercel.New(opts...)
 	case catwalk.TypeTypeSafe:
 		opts := []typesafe.Option{typesafe.WithAPIKey(apiKey)}
-		if provider.APIEndpoint != "" {
-			opts = append(opts, typesafe.WithBaseURL(provider.APIEndpoint))
+		if endpoint != "" {
+			opts = append(opts, typesafe.WithBaseURL(endpoint))
 		}
 		if len(provider.DefaultHeaders) > 0 {
 			opts = append(opts, typesafe.WithHeaders(provider.DefaultHeaders))
 		}
 		p, err = typesafe.New(opts...)
+	case catwalk.TypeCloudflare:
+		opts := []cloudflare.Option{cloudflare.WithAPIKey(apiKey)}
+		if endpoint != "" {
+			opts = append(opts, cloudflare.WithBaseURL(endpoint))
+		} else {
+			opts = append(opts, cloudflare.WithAccountID(os.Getenv(EnvCloudflareAccountID)))
+		}
+		if len(provider.DefaultHeaders) > 0 {
+			opts = append(opts, cloudflare.WithHeaders(provider.DefaultHeaders))
+		}
+		p, err = cloudflare.New(opts...)
 	case catwalk.TypeKev:
 		opts := []kev.Option{kev.WithAutoLibraries()}
 		if modelID != "" && modelID != kev.ModelLatest {
@@ -432,4 +461,21 @@ func resolveEnv(value string) string {
 		return os.Getenv(name)
 	}
 	return value
+}
+
+// expandEndpoint expands $VAR and ${VAR} references in an endpoint. Unset
+// variables are an error rather than silently producing a malformed URL.
+func expandEndpoint(endpoint string) (string, error) {
+	var missing []string
+	expanded := os.Expand(endpoint, func(name string) string {
+		value, ok := os.LookupEnv(name)
+		if !ok || value == "" {
+			missing = append(missing, name)
+		}
+		return value
+	})
+	if len(missing) > 0 {
+		return "", fmt.Errorf("%w: $%s", ErrUnresolvedEndpoint, strings.Join(missing, ", $"))
+	}
+	return expanded, nil
 }
