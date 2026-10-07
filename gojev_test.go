@@ -299,3 +299,63 @@ func TestFromCatwalk(t *testing.T) {
 		t.Fatalf("local kev model=%v err=%v", localKev, err)
 	}
 }
+
+func TestFromCatwalkCloudflare(t *testing.T) {
+	var gotPath, gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotAuth = r.URL.Path, r.Header.Get("Authorization")
+		_, _ = w.Write([]byte(`{"result":{"model":"clef","answers":{"q":{"type":"noul","noul":0.7}},"usage":{"input_tokens":3,"output_tokens":0}},"success":true,"errors":[],"messages":[]}`))
+	}))
+	defer server.Close()
+	t.Setenv("TEST_CF_TOKEN", "cf-token")
+	t.Setenv("TEST_CF_ACCOUNT", "acct-1")
+
+	// The catwalk entry templates the account id into the endpoint.
+	model, err := FromCatwalk(context.Background(), catwalk.Provider{
+		ID:                       catwalk.InferenceProviderCloudflare,
+		Type:                     catwalk.TypeCloudflare,
+		APIKey:                   "$TEST_CF_TOKEN",
+		APIEndpoint:              server.URL + "/accounts/${TEST_CF_ACCOUNT}/ai/run",
+		DefaultEvaluationModelID: "clef",
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if model.Provider() != "cloudflare" || model.Model() != "clef" {
+		t.Fatalf("provider=%q model=%q", model.Provider(), model.Model())
+	}
+	answer, err := Ask(context.Background(), model, "x", Bool("?"))
+	if err != nil || !answer.Yes() {
+		t.Fatalf("answer=%+v err=%v", answer, err)
+	}
+	if gotPath != "/accounts/acct-1/ai/run/@cf/cloudflare/clef" || gotAuth != "Bearer cf-token" {
+		t.Fatalf("path=%q auth=%q", gotPath, gotAuth)
+	}
+
+	// Model override, with or without the Workers AI prefix.
+	flash, err := FromCatwalk(context.Background(), catwalk.Provider{Type: catwalk.TypeCloudflare, APIKey: "k", APIEndpoint: server.URL}, "@cf/cloudflare/clef-flash")
+	if err != nil || flash.Model() != "clef-flash" {
+		t.Fatalf("flash model=%v err=%v", flash, err)
+	}
+
+	// Hosted: a key is required.
+	if _, err := FromCatwalk(context.Background(), catwalk.Provider{Type: catwalk.TypeCloudflare, APIEndpoint: server.URL}, ""); !errors.Is(err, ErrMissingAPIKey) {
+		t.Fatalf("err = %v", err)
+	}
+	// An endpoint referencing an unset variable is rejected rather than
+	// producing a malformed URL.
+	t.Setenv("GOJEV_UNSET_ACCOUNT", "")
+	if _, err := FromCatwalk(context.Background(), catwalk.Provider{Type: catwalk.TypeCloudflare, APIKey: "k", APIEndpoint: "https://api.cloudflare.com/client/v4/accounts/$GOJEV_UNSET_ACCOUNT/ai/run"}, ""); !errors.Is(err, ErrUnresolvedEndpoint) {
+		t.Fatalf("err = %v", err)
+	}
+	// No endpoint: the account comes from the environment.
+	t.Setenv(EnvCloudflareAccountID, "")
+	if _, err := FromCatwalk(context.Background(), catwalk.Provider{Type: catwalk.TypeCloudflare, APIKey: "k"}, ""); err == nil {
+		t.Fatal("expected error without account id")
+	}
+	t.Setenv(EnvCloudflareAccountID, "acct-env")
+	fromEnv, err := FromCatwalk(context.Background(), catwalk.Provider{Type: catwalk.TypeCloudflare, APIKey: "k"}, "")
+	if err != nil || fromEnv.Model() != "clef" {
+		t.Fatalf("env account model=%v err=%v", fromEnv, err)
+	}
+}

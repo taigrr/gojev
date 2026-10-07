@@ -29,12 +29,44 @@ builds:
 
 archives:
   - id: gojev
+    ids:
+      - gojev
     formats: [tar.gz]
     name_template: >-
       {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
     format_overrides:
       - goos: windows
-        formats: [zip]
+        # zip for humans; tar.gz so the npm launcher has one format on every
+        # platform.
+        formats: [zip, tar.gz]
+
+# GoReleaser Pro: generate the npm launcher package + per-platform
+# optional-dependency packages and publish them. Users `npm i -g @taigrr/gojev`
+# (or `npx @taigrr/gojev`) and npm pulls only the binary for their platform.
+npms:
+  - id: gojev
+    ids:
+      - gojev
+    name: "@taigrr/gojev"
+    description: "CLI for System One decision models: Jev, Kev and Clef."
+    homepage: https://github.com/taigrr/gojev
+    repository: https://github.com/taigrr/gojev
+    bugs: https://github.com/taigrr/gojev/issues
+    license: 0BSD
+    author: "Tai Groot <tai@taigrr.com>"
+    keywords:
+      - jev
+      - kev
+      - clef
+      - typesafe
+      - cloudflare
+      - workers-ai
+      - decision-model
+      - system-one
+      - classifier
+      - cli
+    access: public
+    format: tar.gz
 
 checksum:
   name_template: "checksums.txt"

@@ -5,7 +5,7 @@
 [![Lint](https://github.com/taigrr/gojev/actions/workflows/lint.yml/badge.svg)](https://github.com/taigrr/gojev/actions/workflows/lint.yml)
 [![License: 0BSD](https://img.shields.io/badge/license-0BSD-blue.svg)](LICENSE)
 
-Go harness for [System One](https://docs.typesafe.ai/concepts/system-one) decision models: TypeSafe's hosted **Jev** and the open-weight, self-hostable **Kev**.
+Go harness for [System One](https://docs.typesafe.ai/concepts/system-one) decision models: TypeSafe's hosted **Jev**, the open-weight, self-hostable **Kev**, and Cloudflare's **Clef** on Workers AI.
 
 Decision models do not generate text.
 They take a `state` (a string or structured JSON) plus a map of typed questions and return one calibrated answer per question in a single forward pass.
@@ -23,8 +23,9 @@ The protocol layer is in the `taigrr` forks of [fantasy](https://github.com/taig
 - `fantasy.EvaluationModel` / `fantasy.EvaluationProvider` — the modality abstraction.
 - `fantasy/providers/vercel` — Vercel AI Gateway `POST /v1/evaluate` (model `typesafe-ai/jev`).
 - `fantasy/providers/typesafe` — native `POST /v1/systemone` on `api.typesafe.ai`, or any wire-compatible server such as a local Kev.
+- `fantasy/providers/cloudflare` — [Clef](https://huggingface.co/Cloudflare/clef) and Clef-Flash on Cloudflare Workers AI (`POST .../ai/run/@cf/cloudflare/<model>`, Cloudflare envelope unwrapped, embedded images supported).
 - `fantasy/providers/kev` — Kev fully in-process (llama.cpp via yzma), weights downloaded at runtime.
-- `catwalk.Provider.EvaluationModels` — Jev listed under the `vercel` and `typesafe` providers.
+- `catwalk.Provider.EvaluationModels` — Jev listed under the `vercel` and `typesafe` providers; Clef under `cloudflare`.
 
 gojev adds what an agent framework needs on top: catwalk-driven construction, typed decision helpers, the Kev conversion tooling, and a CLI.
 
@@ -80,7 +81,30 @@ Also: `gojev.AskBool(ctx, model, state, q).Above(threshold)`, `gojev.Rate(...)`,
 model, err := gojev.FromCatwalk(ctx, provider, "") // uses provider.DefaultEvaluationModelID
 ```
 
-Works for catwalk entries of type `vercel` and `typesafe`; `$ENV` API keys are resolved.
+Works for catwalk entries of type `vercel`, `typesafe`, `cloudflare` and `kev`; `$ENV` API keys are resolved and `$ENV` references in `api_endpoint` are expanded (the stock `cloudflare` entry uses `$CLOUDFLARE_ACCOUNT_ID`).
+
+### Base URL overrides
+
+Every hosted provider takes a base URL override, so any server that speaks the wire protocol can stand in for the hosted one:
+
+- `typesafe.WithBaseURL` — a local `kev.serve`, or any `/v1/systemone` server.
+- `vercel.WithBaseURL` — a different AI Gateway deployment.
+- `cloudflare.WithBaseURL` — the Workers AI *run root* (`/@cf/cloudflare/<model>` is appended), e.g. an AI Gateway route; `cloudflare.WithAccountID` derives the default root from the account instead.
+
+In catwalk terms this is `api_endpoint`; on the CLI it is `-base-url`.
+
+### Clef on Cloudflare Workers AI
+
+```go
+p, _ := cloudflare.New(
+    cloudflare.WithAccountID(os.Getenv("CLOUDFLARE_ACCOUNT_ID")),
+    cloudflare.WithAPIKey(os.Getenv("CLOUDFLARE_API_TOKEN")),
+    cloudflare.WithGatewayID("default"), // optional: route through an AI Gateway
+)
+model, _ := p.(fantasy.EvaluationProvider).EvaluationModel(ctx, cloudflare.ModelClefFlash)
+```
+
+Clef can also look at images (a Clef extension to the System One API): pass up to four embedded PNG/JPEG/WebP images via `cloudflare.NewEvaluationOptions(&cloudflare.EvaluationOptions{Images: ...})` in `EvaluationCall.ProviderOptions`.
 
 ### Local Kev, in-process
 
@@ -133,7 +157,24 @@ go run ./cmd/gojev -provider vercel \
   -q "risk=score:How risky?;harmless,moderate,dangerous"
 ```
 
-`-provider typesafe|vercel|kev|kev-server`, `-model` picks the Kev checkpoint, `-state -` reads stdin, `-json-state` sends structured state, `-json` prints the raw response, `-zdr` requests zero data retention (Pro/Enterprise gateway plans only).
+`-provider typesafe|vercel|cloudflare|kev|kev-server`, `-model` picks the model or Kev checkpoint, `-base-url` overrides the endpoint for any provider, `-state -` reads stdin, `-json-state` sends structured state, `-json` prints the raw response, `-zdr` requests zero data retention (Pro/Enterprise gateway plans only).
+
+Cloudflare reads `CLOUDFLARE_API_TOKEN` (or `CLOUDFLARE_AUTH_TOKEN`) and `CLOUDFLARE_ACCOUNT_ID` (or `-account`); `-gateway`/`CLOUDFLARE_GATEWAY_ID` routes through an AI Gateway, and `-base-url`/`CLOUDFLARE_WORKERS_AI_URL` replaces the run root entirely.
+
+```sh
+gojev -provider cloudflare -model clef-flash -state "Checkout is failing for every customer" \
+  -q "urgent=bool:Is this urgent?" \
+  -q "severity=score:How severe is the impact?;No impact,Minor,Major,Critical"
+```
+
+### npm
+
+The CLI is also published to npm as a thin launcher that pulls the binary for your platform:
+
+```sh
+npx @taigrr/gojev -version
+npm i -g @taigrr/gojev
+```
 
 ## Development
 
