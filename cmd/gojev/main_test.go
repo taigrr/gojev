@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -149,6 +151,84 @@ func TestRunCloudflare(t *testing.T) {
 	}
 	if gotPath != "/@cf/cloudflare/clef" {
 		t.Fatalf("path = %q", gotPath)
+	}
+}
+
+func TestRunInputRequest(t *testing.T) {
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		_, _ = w.Write([]byte(`{"model":"m","answers":{"refund":{"type":"noul","noul":0.9},"team":{"type":"choice","choice":"billing","probabilities":{"billing":0.9,"shipping":0.1}},"urgency":{"type":"score","score":1.5,"legend":{"0":"low","1":"mid","2":"high"},"probabilities":{"0":0,"1":0.5,"2":0.5}}},"usage":{"input_tokens":1,"output_tokens":0}}`))
+	}))
+	defer server.Close()
+
+	// System One wire shape (noul/criteria) and fantasy's own shape
+	// (bool/options/levels) are both accepted.
+	input := `{
+		"state": {"ticket": "charged twice"},
+		"questions": {
+			"refund": {"type": "noul", "instructions": "Refund?", "criteria": {"true": "asks for money back"}},
+			"team": {"type": "choice", "instructions": "Team?", "criteria": {"billing": "payments", "shipping": null}},
+			"urgency": {"type": "score", "instructions": "Urgency?", "levels": ["low", "mid", "high"]}
+		}
+	}`
+	var out bytes.Buffer
+	err := run([]string{"-provider", "typesafe", "-base-url", server.URL, "-input", "-", "-json"}, strings.NewReader(input), &out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state := gotBody["state"].(map[string]any); state["ticket"] != "charged twice" {
+		t.Fatalf("state = %v", gotBody["state"])
+	}
+	questions := gotBody["questions"].(map[string]any)
+	if criteria := questions["refund"].(map[string]any)["criteria"].(map[string]any); criteria["true"] != "asks for money back" {
+		t.Fatalf("refund criteria = %v", criteria)
+	}
+	if criteria := questions["team"].(map[string]any)["criteria"].(map[string]any); criteria["billing"] != "payments" || criteria["shipping"] != nil {
+		t.Fatalf("team criteria = %v", criteria)
+	}
+	if levels := questions["urgency"].(map[string]any)["criteria"].([]any); len(levels) != 3 || levels[2] != "high" {
+		t.Fatalf("urgency criteria = %v", levels)
+	}
+	var resp struct {
+		Answers map[string]struct {
+			Type               string    `json:"type"`
+			Probability        float64   `json:"probability"`
+			Choice             string    `json:"choice"`
+			Score              float64   `json:"score"`
+			LevelProbabilities []float64 `json:"level_probabilities"`
+		} `json:"answers"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+		t.Fatalf("output not JSON: %v\n%s", err, out.String())
+	}
+	if resp.Answers["refund"].Probability != 0.9 || resp.Answers["team"].Choice != "billing" || resp.Answers["urgency"].Score != 1.5 || len(resp.Answers["urgency"].LevelProbabilities) != 3 {
+		t.Fatalf("answers = %+v", resp.Answers)
+	}
+
+	// A file works too, and -input is exclusive with -state/-q.
+	file := filepath.Join(t.TempDir(), "req.json")
+	if err := os.WriteFile(file, []byte(input), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"-provider", "typesafe", "-base-url", server.URL, "-input", file}, nil, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"-input", "-", "-state", "x"}, strings.NewReader(input), nil); err == nil {
+		t.Fatal("expected exclusivity error")
+	}
+	for _, bad := range []string{
+		`{"questions":{"q":{"type":"noul"}}}`,
+		`{"state":"x"}`,
+		`{"state":"x","questions":{"q":{"type":"mystery"}}}`,
+		`{"state":"x","questions":{"q":{"type":"choice"}}}`,
+		`{"state":"x","questions":{"q":{"type":"score","criteria":["only"]}}}`,
+		`{"state":"x","questions":{"q":{"type":"noul","criteria":["not","an","object"]}}}`,
+		`not json`,
+	} {
+		if err := run([]string{"-provider", "typesafe", "-base-url", server.URL, "-input", "-"}, strings.NewReader(bad), nil); err == nil {
+			t.Fatalf("expected error for %s", bad)
+		}
 	}
 }
 

@@ -8,6 +8,12 @@
 //	  -q "refund=bool:Is the customer asking for money back?" \
 //	  -q "route=choice:Route this ticket;billing=payments,shipping=delivery" \
 //	  -q "urgency=score:How urgent?;low,medium,high"
+//
+// Programs driving gojev (such as the npm wrapper) pass a whole request as
+// JSON instead, in the System One shape, and read the response with -json:
+//
+//	echo '{"state":"I was charged twice","questions":{"refund":{"type":"noul","instructions":"Refund?"}}}' \
+//	  | gojev -input - -json
 package main
 
 import (
@@ -64,6 +70,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	gatewayID := flags.String("gateway", "", "cloudflare: route through the named AI Gateway")
 	state := flags.String("state", "", "state text to evaluate, or - to read stdin")
 	stateJSON := flags.Bool("json-state", false, "parse state as JSON instead of a string")
+	input := flags.String("input", "", "read a JSON {state, questions} request from this file, or - for stdin (replaces -state/-q)")
 	asJSON := flags.Bool("json", false, "print the full response as JSON")
 	zdr := flags.Bool("zdr", false, "vercel: require zero data retention")
 	timeout := flags.Duration("timeout", 60*time.Second, "request timeout")
@@ -78,18 +85,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 		fmt.Fprintln(stdout, "gojev", version.Version)
 		return nil
 	}
-	if *state == "" {
-		return errors.New("-state is required")
-	}
-	if len(questions) == 0 {
-		return errors.New("at least one -q is required")
-	}
-
-	stateValue, err := buildState(*state, *stateJSON, stdin)
-	if err != nil {
-		return err
-	}
-	parsed, err := parseQuestions(questions)
+	stateValue, parsed, err := buildRequest(*input, *state, *stateJSON, questions, stdin)
 	if err != nil {
 		return err
 	}
@@ -127,6 +123,139 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	}
 	printResponse(stdout, resp)
 	return nil
+}
+
+// buildRequest resolves the state and questions from either -input or the
+// -state/-q flags; mixing the two is an error.
+func buildRequest(input, state string, parseJSON bool, questions questionFlags, stdin io.Reader) (any, gojev.Questions, error) {
+	if input != "" {
+		if state != "" || len(questions) > 0 {
+			return nil, nil, errors.New("-input cannot be combined with -state or -q")
+		}
+		return readInput(input, stdin)
+	}
+	if state == "" {
+		return nil, nil, errors.New("-state or -input is required")
+	}
+	if len(questions) == 0 {
+		return nil, nil, errors.New("at least one -q is required")
+	}
+	stateValue, err := buildState(state, parseJSON, stdin)
+	if err != nil {
+		return nil, nil, err
+	}
+	parsed, err := parseQuestions(questions)
+	if err != nil {
+		return nil, nil, err
+	}
+	return stateValue, parsed, nil
+}
+
+// inputRequest is the JSON request accepted by -input. Questions use the
+// System One wire shape (type noul|choice|score with criteria); fantasy's
+// own shape (type bool with options/levels/true_criteria/false_criteria) is
+// accepted too.
+type inputRequest struct {
+	State     json.RawMessage          `json:"state"`
+	Questions map[string]inputQuestion `json:"questions"`
+}
+
+type inputQuestion struct {
+	Type          string            `json:"type"`
+	Instructions  string            `json:"instructions"`
+	Criteria      json.RawMessage   `json:"criteria,omitempty"`
+	Options       map[string]string `json:"options,omitempty"`
+	Levels        []string          `json:"levels,omitempty"`
+	TrueCriteria  string            `json:"true_criteria,omitempty"`
+	FalseCriteria string            `json:"false_criteria,omitempty"`
+}
+
+func readInput(source string, stdin io.Reader) (any, gojev.Questions, error) {
+	var data []byte
+	var err error
+	if source == stateStdin {
+		if stdin == nil {
+			return nil, nil, errors.New("no stdin available for -input -")
+		}
+		data, err = io.ReadAll(stdin)
+	} else {
+		data, err = os.ReadFile(source)
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("read -input: %w", err)
+	}
+	var req inputRequest
+	if err := json.Unmarshal(data, &req); err != nil {
+		return nil, nil, fmt.Errorf("parse -input: %w", err)
+	}
+	if len(req.State) == 0 || string(req.State) == "null" {
+		return nil, nil, errors.New("-input: state is required")
+	}
+	if len(req.Questions) == 0 {
+		return nil, nil, errors.New("-input: at least one question is required")
+	}
+	var state any
+	if err := json.Unmarshal(req.State, &state); err != nil {
+		return nil, nil, fmt.Errorf("-input: state: %w", err)
+	}
+	questions := make(gojev.Questions, len(req.Questions))
+	for name, question := range req.Questions {
+		parsed, err := decodeInputQuestion(question)
+		if err != nil {
+			return nil, nil, fmt.Errorf("-input: question %q: %w", name, err)
+		}
+		questions[name] = parsed
+	}
+	return state, questions, nil
+}
+
+func decodeInputQuestion(in inputQuestion) (fantasy.EvaluationQuestion, error) {
+	hasCriteria := len(in.Criteria) > 0 && string(in.Criteria) != "null"
+	switch strings.TrimSpace(in.Type) {
+	case "bool", "boolean", typesafe.WireTypeNoul:
+		trueCriteria, falseCriteria := in.TrueCriteria, in.FalseCriteria
+		if hasCriteria {
+			var criteria map[string]string
+			if err := json.Unmarshal(in.Criteria, &criteria); err != nil {
+				return fantasy.EvaluationQuestion{}, fmt.Errorf("criteria must be a {true, false} object: %w", err)
+			}
+			trueCriteria, falseCriteria = criteria["true"], criteria["false"]
+		}
+		return fantasy.BoolQuestionWithCriteria(in.Instructions, trueCriteria, falseCriteria), nil
+	case typesafe.WireTypeChoice:
+		options := in.Options
+		if hasCriteria {
+			var criteria map[string]*string
+			if err := json.Unmarshal(in.Criteria, &criteria); err != nil {
+				return fantasy.EvaluationQuestion{}, fmt.Errorf("criteria must be an option-to-description object: %w", err)
+			}
+			options = make(map[string]string, len(criteria))
+			for option, description := range criteria {
+				if description != nil {
+					options[option] = *description
+					continue
+				}
+				options[option] = ""
+			}
+		}
+		if len(options) == 0 {
+			return fantasy.EvaluationQuestion{}, errors.New("choice needs at least one option")
+		}
+		return gojev.Choice(in.Instructions, options), nil
+	case typesafe.WireTypeScore:
+		levels := in.Levels
+		if hasCriteria {
+			if err := json.Unmarshal(in.Criteria, &levels); err != nil {
+				return fantasy.EvaluationQuestion{}, fmt.Errorf("criteria must be an array of level names: %w", err)
+			}
+		}
+		if len(levels) < 2 {
+			return fantasy.EvaluationQuestion{}, errors.New("score needs at least two levels")
+		}
+		return gojev.Score(in.Instructions, levels...), nil
+	default:
+		return fantasy.EvaluationQuestion{}, fmt.Errorf("unknown type %q", in.Type)
+	}
 }
 
 func buildState(state string, parseJSON bool, stdin io.Reader) (any, error) {
