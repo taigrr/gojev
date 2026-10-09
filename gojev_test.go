@@ -14,12 +14,13 @@ import (
 )
 
 type stubModel struct {
-	name    string
-	resp    *fantasy.EvaluationResponse
-	err     error
-	loadErr error
-	calls   *int
-	loaded  *bool
+	name     string
+	resp     *fantasy.EvaluationResponse
+	err      error
+	loadErr  error
+	closeErr error
+	calls    *int
+	loaded   *bool
 }
 
 func (s stubModel) Evaluate(context.Context, fantasy.EvaluationCall) (*fantasy.EvaluationResponse, error) {
@@ -39,6 +40,7 @@ func (s stubModel) Load(context.Context) error {
 	}
 	return nil
 }
+func (s stubModel) Close() error { return s.closeErr }
 
 var validCall = fantasy.EvaluationCall{State: "s", Questions: Questions{"q": Bool("?")}}
 
@@ -101,6 +103,11 @@ func TestFallback(t *testing.T) {
 	allDown := Fallback(stubModel{name: "k", loadErr: errors.New("offline")})
 	if err := allDown.(interface{ Load(context.Context) error }).Load(context.Background()); err == nil || !strings.Contains(err.Error(), "k/k-model: offline") {
 		t.Fatalf("all-down load err = %v", err)
+	}
+
+	closeErr := errors.New("stuck")
+	if err := Fallback(stubModel{name: "a"}, stubModel{name: "b", closeErr: closeErr}).(interface{ Close() error }).Close(); !errors.Is(err, closeErr) || !strings.Contains(err.Error(), "b/b-model") {
+		t.Fatalf("close err = %v", err)
 	}
 }
 
