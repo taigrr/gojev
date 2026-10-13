@@ -200,6 +200,9 @@ func readInput(source string, stdin io.Reader) (any, gojev.Questions, error) {
 	}
 	questions := make(gojev.Questions, len(req.Questions))
 	for name, question := range req.Questions {
+		if strings.TrimSpace(name) == "" {
+			return nil, nil, errors.New("-input: question name is required")
+		}
 		parsed, err := decodeInputQuestion(question)
 		if err != nil {
 			return nil, nil, fmt.Errorf("-input: question %q: %w", name, err)
