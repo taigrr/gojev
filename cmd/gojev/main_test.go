@@ -224,6 +224,7 @@ func TestRunInputRequest(t *testing.T) {
 		`{"state":"x","questions":{"q":{"type":"choice"}}}`,
 		`{"state":"x","questions":{"q":{"type":"score","criteria":["only"]}}}`,
 		`{"state":"x","questions":{"q":{"type":"noul","criteria":["not","an","object"]}}}`,
+		`{"state":"x","questions":{"":{"type":"noul","instructions":"?"}}}`,
 		`not json`,
 	} {
 		if err := run([]string{"-provider", "typesafe", "-base-url", server.URL, "-input", "-"}, strings.NewReader(bad), nil); err == nil {
