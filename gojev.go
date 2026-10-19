@@ -20,6 +20,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/taigrr/catwalk/pkg/catwalk"
@@ -265,7 +266,9 @@ func (r Rating) AtLeast(level string) bool {
 
 // Rate asks a Score question and returns a typed Rating. The caller's
 // levels are used as the rubric labels so lookups by name always match
-// what was asked, regardless of any normalisation the model applies.
+// what was asked, regardless of any normalisation the model applies. The
+// returned rubric and probabilities are independent copies, so reusing the
+// caller's or model's slices does not change an existing rating.
 func Rate(ctx context.Context, model fantasy.EvaluationModel, state any, instructions string, levels ...string) (Rating, error) {
 	answer, err := Ask(ctx, model, state, Score(instructions, levels...))
 	if err != nil {
@@ -277,7 +280,7 @@ func Rate(ctx context.Context, model fantasy.EvaluationModel, state any, instruc
 	if len(answer.Levels) != 0 && len(answer.Levels) != len(levels) {
 		return Rating{}, fmt.Errorf("%w: model echoed %d levels for %d asked", ErrAnswerTypeMismatch, len(answer.Levels), len(levels))
 	}
-	return Rating{Score: answer.Score, Levels: levels, Probabilities: answer.LevelProbabilities, Confidence: answer.Confidence}, nil
+	return Rating{Score: answer.Score, Levels: slices.Clone(levels), Probabilities: slices.Clone(answer.LevelProbabilities), Confidence: answer.Confidence}, nil
 }
 
 // Fallback chains models: each call tries them in order and returns the first
