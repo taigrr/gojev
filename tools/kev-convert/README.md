@@ -7,7 +7,7 @@ Requires `uv` and a [llama.cpp](https://github.com/ggml-org/llama.cpp) checkout 
 
 ```sh
 git clone --depth 1 https://github.com/ggml-org/llama.cpp
-uv run convert.py --run jaredpalmer/kev-4b --out out/kev-4b --llama-cpp ./llama.cpp
+uv run convert.py --run jaredpalmer/kev-4b@night2-du-release --out out/kev-4b --llama-cpp ./llama.cpp
 uv run reference.py --run jaredpalmer/kev-4b --out out/kev-4b/reference.json   # optional: parity fixtures
 ./publish.sh taigrr out/kev-4b                                                   # needs `hf auth login`
 ```
@@ -18,8 +18,12 @@ exports with `--no-mtp` (the Go path never generates), and writes:
 | File | Contents |
 | --- | --- |
 | `model-f16.gguf` | merged backbone |
-| `head.json` | pointer head `q`/`k` weights, calibration temperature, dims |
-| `manifest.json` | sha256 + size of each file; the Go downloader verifies these |
+| `head.json` | pointer head `q`/`k` weights, calibration temperature, dims, source revision |
+| `manifest.json` | source revision plus sha256 + size of each file; the Go downloader verifies these |
+
+Use `--run owner/repo@revision` to pin a Kev tag, branch, or commit. Bundles record both
+`source_revision` (the requested revision, default `main`) and `source_commit` (the resolved Hub snapshot
+commit when available), so downstream GGUF artifacts remain tied to the upstream checkpoint that produced them.
 
 Parity: with `KEV_TEST_BUNDLE=out/kev-4b go test -run Integration ./providers/kev` in fantasy, Go output
 matches the Python reference to two decimals on all fixtures for 0.8B, 4B and 9B.
