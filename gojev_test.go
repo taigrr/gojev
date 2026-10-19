@@ -21,6 +21,7 @@ type stubModel struct {
 	closeErr error
 	calls    *int
 	loaded   *bool
+	closed   *int
 }
 
 func (s stubModel) Evaluate(context.Context, fantasy.EvaluationCall) (*fantasy.EvaluationResponse, error) {
@@ -40,7 +41,12 @@ func (s stubModel) Load(context.Context) error {
 	}
 	return nil
 }
-func (s stubModel) Close() error { return s.closeErr }
+func (s stubModel) Close() error {
+	if s.closed != nil {
+		*s.closed++
+	}
+	return s.closeErr
+}
 
 var validCall = fantasy.EvaluationCall{State: "s", Questions: Questions{"q": Bool("?")}}
 
@@ -105,9 +111,21 @@ func TestFallback(t *testing.T) {
 		t.Fatalf("all-down load err = %v", err)
 	}
 
-	closeErr := errors.New("stuck")
-	if err := Fallback(stubModel{name: "a"}, stubModel{name: "b", closeErr: closeErr}).(interface{ Close() error }).Close(); !errors.Is(err, closeErr) || !strings.Contains(err.Error(), "b/b-model") {
+	closed := 0
+	closer := Fallback(
+		stubModel{name: "a", closed: &closed},
+		stubModel{name: "b", closed: &closed, closeErr: errors.New("stuck")},
+	)
+	if err := closer.(interface{ Close() error }).Close(); err == nil || !strings.Contains(err.Error(), "b/b-model: stuck") {
 		t.Fatalf("close err = %v", err)
+	}
+	if closed != 2 {
+		t.Fatalf("closed = %d", closed)
+	}
+
+	empty := Fallback()
+	if empty.Provider() != "" || empty.Model() != "" {
+		t.Fatalf("empty fallback provider=%q model=%q", empty.Provider(), empty.Model())
 	}
 }
 
