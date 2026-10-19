@@ -224,6 +224,7 @@ func TestRunInputRequest(t *testing.T) {
 		`{"state":"x","questions":{"q":{"type":"choice"}}}`,
 		`{"state":"x","questions":{"q":{"type":"score","criteria":["only"]}}}`,
 		`{"state":"x","questions":{"q":{"type":"noul","criteria":["not","an","object"]}}}`,
+		`{"state":"x","questions":{"":{"type":"noul","instructions":"?"}}}`,
 		`not json`,
 	} {
 		if err := run([]string{"-provider", "typesafe", "-base-url", server.URL, "-input", "-"}, strings.NewReader(bad), nil); err == nil {
@@ -251,5 +252,57 @@ func TestRunErrors(t *testing.T) {
 	}
 	if err := run([]string{"-state", "x", "-q", "a=bool:?", "-provider", "nope"}, nil, nil); err == nil {
 		t.Fatal("expected unknown provider error")
+	}
+}
+
+func TestPrintResponse(t *testing.T) {
+	confidence := 0.75
+	resp := &fantasy.EvaluationResponse{
+		Model: "jev-test",
+		Answers: map[string]fantasy.EvaluationAnswer{
+			"route": {
+				Type:          fantasy.EvaluationQuestionTypeChoice,
+				Choice:        "billing",
+				Confidence:    &confidence,
+				Probabilities: map[string]float64{"shipping": 0.2, "billing": 0.7, "returns": 0.7},
+			},
+			"refund": {
+				Type:        fantasy.EvaluationQuestionTypeBool,
+				Probability: 0.9,
+			},
+			"urgency": {
+				Type:               fantasy.EvaluationQuestionTypeScore,
+				Score:              1.6,
+				Levels:             []string{"low", "medium", "high"},
+				LevelProbabilities: []float64{0.1, 0.3, 0.6},
+				Confidence:         &confidence,
+			},
+			"raw": {
+				Type: "mystery",
+			},
+		},
+		Usage: fantasy.EvaluationUsage{InputTokens: 9, OutputTokens: 2},
+	}
+
+	var out bytes.Buffer
+	printResponse(&out, resp)
+	got := out.String()
+	want := strings.Join([]string{
+		"model: jev-test",
+		"raw: (unrecognised answer type \"mystery\")",
+		"refund: true (p=0.900)",
+		"route: billing (confidence=0.750)",
+		"  billing: 0.700",
+		"  returns: 0.700",
+		"  shipping: 0.200",
+		"urgency: 1.60 high (confidence=0.750)",
+		"  0 low: 0.100",
+		"  1 medium: 0.300",
+		"  2 high: 0.600",
+		"usage: in=9 out=2",
+		"",
+	}, "\n")
+	if got != want {
+		t.Fatalf("output =\n%s\nwant =\n%s", got, want)
 	}
 }
