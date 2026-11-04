@@ -159,6 +159,8 @@ go run ./cmd/gojev -provider vercel \
 
 `-provider typesafe|vercel|cloudflare|kev|kev-server`, `-model` picks the model or Kev checkpoint, `-base-url` overrides the endpoint for any provider, `-state -` reads stdin, `-json-state` sends structured state, `-json` prints the raw response, `-zdr` requests zero data retention (Pro/Enterprise gateway plans only).
 
+JSON state supplied through `-json-state` or `-input` preserves numeric values exactly, including large integer IDs and high-precision decimals.
+
 Cloudflare reads `CLOUDFLARE_API_TOKEN` (or `CLOUDFLARE_AUTH_TOKEN`) and `CLOUDFLARE_ACCOUNT_ID` (or `-account`); `-gateway`/`CLOUDFLARE_GATEWAY_ID` routes through an AI Gateway, and `-base-url`/`CLOUDFLARE_WORKERS_AI_URL` replaces the run root entirely.
 
 ```sh
