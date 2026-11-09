@@ -195,7 +195,7 @@ func readInput(source string, stdin io.Reader) (any, gojev.Questions, error) {
 		return nil, nil, errors.New("-input: at least one question is required")
 	}
 	var state any
-	if err := json.Unmarshal(req.State, &state); err != nil {
+	if err := decodeJSONState(string(req.State), &state); err != nil {
 		return nil, nil, fmt.Errorf("-input: state: %w", err)
 	}
 	questions := make(gojev.Questions, len(req.Questions))
@@ -276,10 +276,27 @@ func buildState(state string, parseJSON bool, stdin io.Reader) (any, error) {
 		return state, nil
 	}
 	var value any
-	if err := json.Unmarshal([]byte(state), &value); err != nil {
+	if err := decodeJSONState(state, &value); err != nil {
 		return nil, fmt.Errorf("parse state as JSON: %w", err)
 	}
 	return value, nil
+}
+
+// decodeJSONState preserves numbers exactly while requiring a single JSON value.
+func decodeJSONState(state string, value *any) error {
+	decoder := json.NewDecoder(strings.NewReader(state))
+	decoder.UseNumber()
+	if err := decoder.Decode(value); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err != nil {
+			return err
+		}
+		return errors.New("state must contain a single JSON value")
+	}
+	return nil
 }
 
 const (

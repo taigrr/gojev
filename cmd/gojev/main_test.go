@@ -98,12 +98,12 @@ func TestRunJSONState(t *testing.T) {
 	var out bytes.Buffer
 	err := run([]string{
 		"-provider", "typesafe", "-base-url", server.URL, "-json",
-		"-state", `{"a":1}`, "-json-state", "-q", "x=bool:?",
+		"-state", `{"a":9007199254740993}`, "-json-state", "-q", "x=bool:?",
 	}, nil, &out)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(gotState, `"state":{"a":1}`) {
+	if !strings.Contains(gotState, `"state":{"a":9007199254740993}`) {
 		t.Fatalf("state = %s", gotState)
 	}
 }
@@ -304,5 +304,41 @@ func TestPrintResponse(t *testing.T) {
 	}, "\n")
 	if got != want {
 		t.Fatalf("output =\n%s\nwant =\n%s", got, want)
+	}
+}
+
+func TestJSONStatePreservesNumbers(t *testing.T) {
+	const state = `{"id":9007199254740993,"nested":[18446744073709551615,0.1234567890123456789,1e400]}`
+	for _, mode := range []string{"flag", "stdin", "input"} {
+		t.Run(mode, func(t *testing.T) {
+			var value any
+			var err error
+			switch mode {
+			case "flag":
+				value, err = buildState(state, true, nil)
+			case "stdin":
+				value, err = buildState(stateStdin, true, strings.NewReader(state))
+			case "input":
+				value, _, err = readInput(stateStdin, strings.NewReader(`{"state":`+state+`,"questions":{"q":{"type":"bool","instructions":"Check?"}}}`))
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := json.Marshal(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(encoded) != state {
+				t.Fatalf("state = %s, want %s", encoded, state)
+			}
+		})
+	}
+}
+
+func TestJSONStateRejectsTrailingData(t *testing.T) {
+	for _, state := range []string{`{"id":1} {"id":2}`, `1 garbage`, `1 ]`} {
+		if _, err := buildState(state, true, nil); err == nil {
+			t.Errorf("accepted %q", state)
+		}
 	}
 }
