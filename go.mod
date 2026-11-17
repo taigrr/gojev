@@ -5,8 +5,8 @@ go 1.27.1
 toolchain go1.27.3
 
 require (
-	github.com/taigrr/catwalk v0.53.0-fork
-	github.com/taigrr/fantasy v0.31.0-fork
+	github.com/taigrr/catwalk v0.54.0-fork
+	github.com/taigrr/fantasy v0.31.1-fork
 )
 
 require (
